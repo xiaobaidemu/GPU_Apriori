@@ -1,0 +1,701 @@
+/*
+ *This is the source code for GPUMiner, a parallel data mining system based on GPUs.
+ *Author: Xiangye Xiao (HKUST), Mian Lu (HKUST), Wenbin Fang (HKUST)
+ *Mentor: Qiong Luo (HKUST)
+ *If you have any question on the code, please contact us at xiaoxy@ust.hk
+ *The copyright is held by HKUST. GPUMiner is provided "as is" without any
+ *guarantees of any kind. 
+ */
+/*----------------------------------------------------------------------
+  File     : Data.h
+  Contents : data set management
+  Author   : Xiangye Xiao
+  Update   : 16/7/2008
+----------------------------------------------------------------------*/
+
+#include <time.h>
+#include <algorithm>
+#include <iostream>
+
+#include "AprioriSets.h"
+#include "../Lu_Kernel/GPUMiner_Kernel.h"
+
+using namespace std;
+
+AprioriSets::AprioriSets()
+{
+	minSup = 0;
+	dataFn = NULL;
+	
+	verbose = true;
+
+	matrix = NULL;
+	matrixSize = 0;
+	trie = new Item(-1);  // item id of root: -1
+
+	numFItem = 0;
+	numTran = 0;
+	num2FI = 0;
+	numKernelCall = 0;
+
+	oidSup = NULL;    //oidSup[new item id in fn] = {new item id in mining, its support}
+	oidSupSize = 0;
+	oidNid = NULL; //<odl item id in fn, new item id in mining>
+
+	bound = 10;
+}
+
+AprioriSets::~AprioriSets()
+{		
+	if(trie) {
+		trie->deleteChildren();
+		delete trie;
+	}
+
+	BenFree((char**)(&matrix), matrixSize);
+	BenFree((char**)(&oidSup), oidSupSize);
+
+	if(oidNid) delete oidNid;
+}
+
+//input transaction set file
+//binary file
+//transaction set in the vertical matrix format
+void AprioriSets::setData(char *fn)
+{
+	dataFn = fn;
+}
+
+int AprioriSets::setOutputSets(char *fn)
+{
+	setsout.open(fn);
+	if(!setsout.is_open()) {
+		cerr << "error: could not open " << fn << endl;
+		return -1;
+	}
+	return 0;
+}
+
+//pass=level: the length of frequent itemset
+int AprioriSets::generateSets()
+{
+  int total=0, pass=0;
+  bool running = true;
+
+  clock_t genTime = 0;
+  while(running) {
+    clock_t start;
+    int generated=0, nodes=0, left=0; //tnr: transaction number; pruned: item# after prune
+
+    pass++;
+	cout << "----------pass: " << pass << " ----------" << endl;
+
+	clock_t genTimer = 0;
+    if(pass>2) 
+	{
+      start = clock();
+      generated = generateCandidates(pass);
+      nodes = pruneNodes(pass);
+
+	  genTimer = (clock()-start);
+  	  if(verbose) 
+		cout << "candidate#: " << generated << endl
+			 << "\t[candidate generation time: " << (clock()-start)/double(CLOCKS_PER_SEC) << "s] " << endl;	
+			 
+
+    }
+
+    start = clock();
+    countSupports(pass);
+    if(verbose) 
+	{
+		if(pass == 1)
+		{
+			cout << "pattern#: " << numFItem << "   " << "transaction#: " << numTran << endl;
+			left = numFItem;
+		}
+		else if(pass == 2)
+		{
+			cout << "pattern#: " << num2FI << endl;
+			left = num2FI;
+		}
+
+		cout << "\t[count support time: " << (clock()-start)/double(CLOCKS_PER_SEC) << "s] " << "   " << endl;		
+		cout << "\t\tkernel call#: " << numKernelCall << endl;
+		cout << "\tmemory copy time: " << getCopyTime() << "s" << endl;
+		cout << "\tsum on the cpu time: " << getCountTime() << "s" << endl;
+		cout << "\tkernel time: " << getKernelTime() << "s" << endl;
+	}
+
+    //if(pass==1 && setsout.is_open()) printSet(*trie,0,0); 
+
+    if(pass>2) 
+	{	
+		start = clock();
+		left = pruneCandidates(pass);
+		if(verbose) 
+		{
+			cout << "pattern#: " << left << endl
+				 << "\t[pattern identification time: " << (clock()-start)/double(CLOCKS_PER_SEC) << "s]" << endl;
+		}
+		genTime += genTimer;
+	}
+
+    total += left;
+    if(left <= pass) running = false;
+  }
+
+  cout << endl;
+  
+  cout << "generation time: " << genTime/double(CLOCKS_PER_SEC) << "s" << endl;
+
+  return total;
+}
+
+
+//count the supports of k-candidates, k is level
+
+void AprioriSets::countSupports(int level)
+{
+	// count all single items
+	if(level==1) {
+
+		// count support, remove infreq items, sort items by count,对item进行排序，encode items, construct matrix
+		//此函数的作用就是对计算单项候选项的支持度，并对其进行枝剪和支持读排序，重构后的矩阵为单项支持度都满足最小支持度,这的&matrix是指matrix的地址，不是引用谢谢
+		EncodeBin(dataFn, minSup, &matrix, &oidSup, &numTran, &numFItem, &matrixSize, &oidSupSize);
+		//trie指向一组Item集合，此时trie应该是root
+		trie->Increment(numTran);
+		set<Item> *items = trie->makeChildren();//注意：children =items
+
+		//  store mapping of old and new item id, insert freq items into trie
+		oidNid = new set<Element>;
+		for(size_t i = 0; i < numFItem; i++)
+		{
+			Item item(i);
+			item.Increment(oidSup[i].sup);
+			items->insert(item);
+
+			oidNid->insert( Element( oidSup[i].id, i ) );
+		}
+
+		//write patterns into file，将频繁模式写入文件中
+		printSet(*trie,0,0); 
+		for(set<Item>::iterator runner = items->begin(); runner != items->end(); runner++) 
+		{			
+			int itemset = runner->getId();
+			printSet(*runner, &itemset, level);	
+		}
+	}
+	else if(level==2) {
+		//从level==2开始就应该开始使用GPU进行运算了，感觉numFItem其实就是长度为1的频繁项集的个数（不是感觉是一定）
+		//  count support of 2-candidates (all class pairs), insert freq 2-itemsets into trie
+		PairwiseCount(matrix, numTran, numFItem, minSup, trie, &num2FI);//此时已经计算玩了2-freItem,其中trie和num2FI 为出口参数
+
+		//write patterns into file
+		set<Item> *items = trie->getChildren();
+		int * itemset = new int[level];//应该是用来记录项集中每个项的编号，这里是Fre2Item，用一个数组itemset来记录频繁项集
+		for(set<Item>::iterator runner1 = items->begin(); runner1 != items->end(); runner1++) 
+		{			
+			itemset[level-2] = runner1->getId();
+			set<Item> *children = runner1->getChildren();
+			for(set<Item>::iterator runner2 = children->begin(); runner2 != children->end(); runner2++) 
+			{
+				itemset[level-1] = runner2->getId();
+				printSet(*runner2, itemset, level);				
+			}
+		}
+		delete [] itemset;
+
+		unsigned short* m = (unsigned short*)matrix;//unsigned short是两个字节
+		initGPUMiner( m, numFItem, numTran );//当前的m为所有长度为1的频繁项所构成的集合		
+
+	}
+	else // level >= 3
+	{
+		numKernelCall = 0;
+
+		set<Item> *items = trie->getChildren();
+
+		int *bParentList = new int[BOUND];//bound=10;BOUND=20
+		vector<Item*> bItemList;
+		int *bItemLen = new int[BOUND];
+
+		set<Item>::iterator runner = items->begin();
+		int bParentOffset = 0;
+		while(runner!= items->end())
+		{
+			int bNumPair = 0;							// number of parent child pairs process together,先假设level = 3
+			size_t bNumItem = 0;
+
+			bItemList.clear();//清空这一步很重要
+			while(runner!= items->end() && runner->getChildren() && bNumItem < bound)
+			{
+				bParentList[bNumPair] = runner->getId(); 
+
+				set<Item>* children = runner->getChildren();
+				set<Item>::iterator cIt;
+				for(cIt = children->begin(); cIt != children->end(); cIt++) 
+				{
+					Item item = (*cIt);
+					bItemList.push_back(&item);//这块为什么要用取地址
+				}
+
+				bItemLen[bNumPair] = children->size();
+
+				bNumItem += runner->getChildren()->size();
+				bNumPair ++;				
+
+				runner ++;
+				bParentOffset ++;
+			}
+
+			countSupports(level, 2, bParentList, bItemLen, bNumPair, &bItemList, bNumItem, bParentOffset);
+		}
+
+
+		delete [] bParentList;
+		delete [] bItemLen;
+	}
+}
+
+void AprioriSets::countSupports(int level, int depth, int *parentList, int *itemLen, int numPair, vector<Item*>* itemList, size_t numItem, int parentOffset)
+{
+	if (itemList == 0) return;
+
+	int* itemIdList = new int[BOUND];
+	for(int i=0; i<itemList->size(); i++)
+		itemIdList[i] = ((*itemList)[i])->getId();
+
+
+	int * bParentList = new int[numPair];
+	for( int i = 0; i < numPair; i++ )
+			bParentList[i] = i;
+
+	if( depth < level)
+	{
+		if(depth == 2)
+		{
+			gpuBoundVectorAnd( -1, parentList, itemLen, numPair, itemIdList, numItem, depth, false, 0);
+		}
+		else
+		{
+			gpuBoundVectorAnd( parentOffset, bParentList, itemLen, numPair, itemIdList, numItem, depth, false, 0); 
+		}
+
+		int *bItemList = new int[BOUND];
+		vector<Item*> bChildList;
+		int *bChildLen = new int[BOUND];
+		int index = 0;
+		int bItemOffset = 0;
+
+		while(index < numItem)
+		{
+			bItemOffset = index;
+
+			bChildList.clear();
+			int bNumPair = 0;							// number of parent child pairs process together
+			size_t bNumChild = 0;
+
+			Item* curItem = (*itemList)[index];
+			while(index < numItem && curItem->getChildren() && bNumChild < bound)
+			{
+				bItemList[bNumPair] = curItem->getId();
+
+				set<Item>* children = curItem->getChildren();
+				for(set<Item>::iterator cIt = children->begin(); cIt != children->end(); cIt++) 
+				{
+					Item &item = *cIt;
+					bChildList.push_back(&item);
+				}
+
+				bChildLen[bNumPair] = children->size();
+
+				bNumChild += children->size();
+				bNumPair ++;				
+
+				index ++;
+				if(index < numItem)
+					curItem = (*itemList)[index];
+			}
+
+			countSupports(level, depth+1, bItemList, bChildLen, bNumPair, &bChildList, bNumChild, bItemOffset);
+		}
+
+		delete [] bItemList;
+		delete [] bChildLen;
+	}
+	else
+	{
+		int *supList = new int[numItem];
+
+		gpuBoundVectorAnd(parentOffset, bParentList, itemLen, numPair, itemIdList, numItem, depth, true, supList);
+
+		for(int i=0; i<itemList->size(); i++)
+		{
+			Item *item = (*itemList)[i];
+			item->Increment(supList[i]);
+		}
+
+		delete [] supList;	
+	}
+
+	numKernelCall ++;
+}
+
+
+/*
+
+void AprioriSets::countSupports(int level)
+{
+	// count all single items
+	if(level==1) {
+
+		// count support, remove infreq items, sort items by count,对item进行排序，encode items, construct matrix
+		//此函数的作用就是对计算单项候选项的支持度，并对其进行枝剪和支持读排序，重构后的矩阵为单项支持度都满足最小支持度,这的&matrix是指matrix的地址，不是引用谢谢
+		EncodeBin(dataFn, minSup, &matrix, &oidSup, &numTran, &numFItem, &matrixSize, &oidSupSize);
+		//trie指向一组Item集合，此时trie应该是root
+		trie->Increment(numTran);
+		set<Item> *items = trie->makeChildren();//注意：children =items
+
+		//  store mapping of old and new item id, insert freq items into trie
+		oidNid = new set<Element>;
+		for(size_t i = 0; i < numFItem; i++)
+		{
+			Item item(i);
+			item.Increment(oidSup[i].sup);
+			items->insert(item);
+
+			oidNid->insert( Element( oidSup[i].id, i ) );
+		}
+
+		//write patterns into file，将频繁模式写入文件中
+		printSet(*trie,0,0); 
+		for(set<Item>::iterator runner = items->begin(); runner != items->end(); runner++) 
+		{			
+			int itemset = runner->getId();
+			printSet(*runner, &itemset, level);	
+		}
+	}
+	else if(level==2) {
+		//从level==2开始就应该开始使用GPU进行运算了，感觉numFItem其实就是长度为1的频繁项集的个数
+		//  count support of 2-candidates (all class pairs), insert freq 2-itemsets into trie
+		PairwiseCount(matrix, numTran, numFItem, minSup, trie, &num2FI);
+
+		//write patterns into file
+		set<Item> *items = trie->getChildren();
+		int * itemset = new int[level];//应该是用来记录项集中每个项的编号，这里是Fre2Item
+		for(set<Item>::iterator runner1 = items->begin(); runner1 != items->end(); runner1++) 
+		{			
+			itemset[level-2] = runner1->getId();
+			set<Item> *children = runner1->getChildren();
+			for(set<Item>::iterator runner2 = children->begin(); runner2 != children->end(); runner2++) 
+			{
+				itemset[level-1] = runner2->getId();
+				printSet(*runner2, itemset, level);				
+			}
+		}
+		delete [] itemset;
+
+		unsigned short* m = (unsigned short*)matrix;
+		initGPUMiner( m, numFItem, numTran );		
+
+	}
+	else // level >= 3
+	{
+
+		numKernelCall = 0;
+
+		set<Item> *items = trie->getChildren();
+
+		int *bParentList = new int[BOUND];
+		vector<Item*> bItemList;
+		int *bItemLen = new int[BOUND];
+
+		set<Item>::iterator runner = items->begin();
+		int bParentOffset = 0;
+		while(runner!= items->end())
+		{
+			int bNumPair = 0;							// number of parent child pairs process together
+			size_t bNumItem = 0;
+
+			bItemList.clear();
+			while(runner!= items->end() && runner->getChildren() && bNumItem < bound)
+			{
+				bParentList[bNumPair] = runner->getId(); 
+
+				set<Item>* children = runner->getChildren();
+				set<Item>::iterator cIt;
+				for(cIt = children->begin(); cIt != children->end(); cIt++) 
+				{
+					Item item = (*cIt);
+					bItemList.push_back(&item);
+				}
+
+				bItemLen[bNumPair] = children->size();
+
+				bNumItem += runner->getChildren()->size();
+				bNumPair ++;				
+
+				runner ++;
+				bParentOffset ++;
+			}
+
+			countSupports(level, 2, bParentList, bItemLen, bNumPair, &bItemList, bNumItem, bParentOffset);
+		}
+
+
+		delete [] bParentList;
+		delete [] bItemLen;
+	}
+}
+
+void AprioriSets::countSupports(int level, int depth, int *parentList, int *itemLen, int numPair, vector<Item*>* itemList, size_t numItem, int parentOffset)
+{
+	if (itemList == 0) return;
+
+	int* itemIdList = new int[BOUND];
+	for(int i=0; i<itemList->size(); i++)
+		itemIdList[i] = ((*itemList)[i])->getId();
+
+
+	int * bParentList = new int[numPair];
+	for( int i = 0; i < numPair; i++ )
+		bParentList[i] = i;
+
+	if( depth < level)
+	{
+		if(depth == 2)
+		{
+			gpuBoundVectorAnd( -1, parentList, itemLen, numPair, itemIdList, numItem, depth, false, 0);
+		}
+		else
+		{
+			gpuBoundVectorAnd( parentOffset, bParentList, itemLen, numPair, itemIdList, numItem, depth, false, 0); 
+		}
+
+		int *bItemList = new int[BOUND];
+		vector<Item*> bChildList;
+		int *bChildLen = new int[BOUND];
+		int index = 0;
+		int bItemOffset = 0;
+
+		while(index < numItem)
+		{
+			bItemOffset = index;
+
+			bChildList.clear();
+			int bNumPair = 0;							// number of parent child pairs process together
+			size_t bNumChild = 0;
+
+			Item* curItem = (*itemList)[index];
+			while(index < numItem && curItem->getChildren() && bNumChild < bound)
+			{
+				bItemList[bNumPair] = curItem->getId();
+
+				set<Item>* children = curItem->getChildren();
+				for(set<Item>::iterator cIt = children->begin(); cIt != children->end(); cIt++) 
+				{
+					Item item = *cIt;
+					bChildList.push_back(&item);
+				}
+
+				bChildLen[bNumPair] = children->size();
+
+				bNumChild += children->size();
+				bNumPair ++;				
+
+				index ++;
+				if(index < numItem)
+					curItem = (*itemList)[index];
+			}
+
+			countSupports(level, depth+1, bItemList, bChildLen, bNumPair, &bChildList, bNumChild, bItemOffset);
+		}
+
+		delete [] bItemList;
+		delete [] bChildLen;
+	}
+	else
+	{
+		int *supList = new int[numItem];
+
+		gpuBoundVectorAnd(parentOffset, bParentList, itemLen, numPair, itemIdList, numItem, depth, true, supList);
+
+		for(int i=0; i<itemList->size(); i++)
+		{
+			Item *item = (*itemList)[i];
+			item->Increment(supList[i]);
+		}
+
+		delete [] supList;	
+	}
+
+	numKernelCall ++;
+}*/
+
+
+//after prune, trie remains the left itemsets
+int AprioriSets::pruneCandidates(int level)
+{
+	int left;
+	int *tmp = new int[level];
+	left = pruneCandidates(level,trie->getChildren(),1,tmp);
+	delete [] tmp;
+
+	return left;
+}
+
+
+//prune itemsets whose sup < minsup
+int AprioriSets::pruneCandidates(int level, set<Item> *items, int depth, int *itemset)
+{
+	if(items == 0) return 0;
+	int left = 0; //itemset # that are not pruned, i.e., remained as frequent
+
+	for(set<Item>::iterator runner = items->begin(); runner != items->end(); ) {
+		itemset[depth-1] = runner->getId();
+
+	    if(depth == level) {
+			if(runner->getSupport() < minSup) {
+				runner->deleteChildren();
+				set<Item>::iterator tmp = runner++; //i.e., tmp=runner, runner++
+				items->erase(tmp);
+			}
+			else {
+				if(setsout.is_open()) printSet(*runner, itemset, depth);
+					left++;
+					runner++;
+			}
+		}
+		else {	
+			int now = pruneCandidates(level, runner->getChildren(), depth+1, itemset);
+			if(now) {
+				left += now;
+				runner++;
+			}
+			else {
+				runner->deleteChildren();
+				set<Item>::iterator tmp = runner++;
+				items->erase(tmp);
+			}
+		}
+	}
+
+	return left;
+}
+
+//print frequent itemsets into a file
+void AprioriSets::printSet(const Item& item, int *itemset, int length)
+{
+	set<int> outset;
+
+	for(int j=0; j<length; j++) 
+		if(oidSup) outset.insert(oidSup[itemset[j]].id); 
+		else outset.insert(itemset[j]); 
+	for(set<int>::iterator k=outset.begin(); k!=outset.end(); k++)  setsout << *k << " ";
+	setsout << "(" << item.getSupport() << ")" << endl;
+}
+
+
+//when level > 2, generate candidates
+//DFS traversal of trie
+int AprioriSets::generateCandidates(int level)
+{
+	int *tmp = new int[level];
+	int generated = generateCandidates(level, trie->getChildren(), 1, tmp);
+	delete [] tmp;
+
+	return generated;
+}
+
+int AprioriSets::generateCandidates(int level, set<Item> *items, int depth, int *current)
+{
+	if(items == 0) return 0;
+
+	int generated = 0;
+	set<Item>::reverse_iterator runner;
+
+	if(depth == level-1) {
+		for(runner = items->rbegin(); runner != items->rend(); runner++) {
+			current[depth-1] = runner->getId();
+			set<Item> *children = runner->makeChildren();
+
+			for(set<Item>::reverse_iterator it = items->rbegin(); it != runner; it++) {
+				current[depth] = it->getId();
+				if(level<=2 || checkSubsets(level,current, trie->getChildren(), 0, 1)) {
+					children->insert(Item(it->getId()));
+					generated++;
+				}
+			}
+		}
+	}
+	else {
+		for(runner = items->rbegin(); runner != items->rend(); runner++) {
+			current[depth-1] = runner->getId();
+			generated += generateCandidates(level, runner->getChildren(), depth+1, current);
+		}
+	}
+	return generated;
+}
+
+//check whether subsets of a itemset is on trie
+bool AprioriSets::checkSubsets(int sl, int *iset, set<Item> *items, int spos, int depth)
+{
+	if(items==0) return 0;
+
+	bool ok = true;
+	set<Item>::iterator runner;
+	int loper = spos;
+	spos = depth+1;
+
+	while(ok && (--spos >= loper)) {
+		runner = items->find(Item(iset[spos]));
+		if(runner != items->end()) {
+			if(depth<sl-1) ok = checkSubsets(sl, iset, runner->getChildren(), spos+1, depth+1);
+		}
+		else ok=false;
+	}
+
+	return ok;
+}
+
+//prune "dead end" nodes
+int AprioriSets::pruneNodes(int level)
+{
+	return pruneNodes(level,trie->getChildren(),1);
+}
+
+int AprioriSets::pruneNodes(int level, set<Item> *items, int depth)
+{
+	if(items == 0) return 0;
+
+	int nodes = 0;
+
+	if(depth==level) nodes = (int)items->size();
+	else {
+		for(set<Item>::iterator runner = items->begin(); runner != items->end(); ) {
+			int now = pruneNodes(level, runner->getChildren(), depth+1);
+			if(now) {
+				nodes += now;
+				nodes++;
+				runner++;
+			}
+			else {
+				runner->deleteChildren();
+				set<Item>::iterator tmp = runner++;
+				items->erase(tmp);
+			}
+		}
+	}
+
+	return nodes;
+}
+
+int AprioriSets::countL2Nodes()
+{
+	set<Item> *items = trie->getChildren();
+	int count = 0;
+	for(set<Item>::iterator runner = items->begin(); runner != items->end(); )
+		count += (int) runner->getChildren()->size();
+	return count;
+}
